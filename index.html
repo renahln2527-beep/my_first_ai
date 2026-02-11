@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiddo World 奇妙世界</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@300;400;500;600;700&display=swap');
+        
+        body {
+            font-family: 'Fredoka', 'Microsoft YaHei', sans-serif;
+            background-color: #E0F2FE;
+            background-image: radial-gradient(#bae6fd 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+        .app-container { transition: all 0.3s ease; }
+        /* 宠物与背包固定显示，不被主容器遮挡 */
+        #pet-container, [data-backpack-wrap] { visibility: visible; pointer-events: auto; z-index: 20; }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4 relative">
+
+    <div id="break-overlay" class="fixed inset-0 z-[100] hidden"></div>
+    <div id="parent-modal" class="hidden"></div>
+    <div id="dashboard-overlay" class="fixed inset-0 z-[90] bg-white overflow-auto hidden"></div>
+    <button type="button" id="parent-lock" class="fixed top-4 right-4 p-2 rounded-full bg-white/90 shadow z-30 text-gray-500 hover:bg-gray-200" title="家长入口">🔒</button>
+
+    <div id="main-content" class="app-container w-full max-w-4xl bg-white rounded-[2rem] shadow-2xl overflow-hidden min-h-[600px] border-4 border-sky-200 relative z-10">
+        <div class="flex flex-col items-center justify-center h-[600px] space-y-4">
+            <div class="w-16 h-16 border-4 border-blue-400 border-t-transparent rounded-full animate-spin"></div>
+            <h2 class="text-2xl text-blue-400 font-bold">正在进入奇妙世界...</h2>
+        </div>
+    </div>
+
+    <div id="pet-container" class="fixed left-2 bottom-6 w-24 h-28 bg-white/95 rounded-2xl shadow-lg border-2 border-amber-200 flex items-center justify-center z-20"></div>
+    <div id="progress-strip" class="fixed top-5 left-5 z-[1000] text-xs text-gray-700 space-y-0.5 max-w-[11rem] bg-white/80 py-2.5 px-2.5 rounded-[10px] font-bold shadow-md pointer-events-none" title="解锁进度">
+      <p class="truncate" data-word-progress>📖 单词解锁: 0 / 0</p>
+      <p class="truncate" data-sentence-progress>🗣️ 句子解锁: 0 / 0</p>
+    </div>
+    <div data-backpack-wrap class="fixed right-2 bottom-6 z-20">
+        <div class="bg-white/95 rounded-2xl shadow-lg border-2 border-green-200 px-3 py-2 flex flex-col items-center min-w-[80px]" data-backpack>
+            <span class="text-xs font-bold text-gray-600 mb-1">背包</span>
+            <div class="flex flex-wrap gap-0.5 justify-center"><span data-apple-count>0</span></div>
+        </div>
+    </div>
+
+    <script src="data.js"></script>
+    <script src="js/store.js"></script>
+    <script src="js/pet.js"></script>
+    <script src="js/learn.js"></script>
+    <script src="js/app.js"></script>
+
+</body>
+</html>
