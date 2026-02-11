@@ -40,59 +40,162 @@
     });
   }
 
-  function listenSTT() {
-    return new Promise((resolve, reject) => {
-      if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-        reject(new Error('No speech recognition'));
-        return;
+  /** 检测浏览器支持的录音 MIME 类型，优先 webm，备选 ogg / mp4（兼容安卓/华为） */
+  function getSupportedAudioMimeType() {
+    if (typeof window === 'undefined' || !window.MediaRecorder) return '';
+    var types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/mp4'];
+    for (var i = 0; i < types.length; i++) {
+      if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(types[i])) return types[i];
+    }
+    return '';
+  }
+
+  /** 获取麦克风流，使用明确音频约束（兼容安卓/华为），约束失败时回退为 audio: true；失败时在控制台打印原因 */
+  function getMicStream() {
+    var constraints = {
+      audio: {
+        channelCount: 1,
+        sampleRate: 16000,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
+    };
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      var err = new Error('getUserMedia not supported');
+      if (typeof console !== 'undefined' && console.error) console.error('[录音] 获取麦克风失败:', err.message);
+      return Promise.reject(err);
+    }
+    return navigator.mediaDevices.getUserMedia(constraints).catch(function(err) {
+      var msg = err.name + ': ' + (err.message || '') + (err.constraint ? ' (constraint: ' + err.constraint + ')' : '');
+      if (typeof console !== 'undefined' && console.error) console.error('[录音] 获取麦克风权限失败:', msg);
+      if (err.name === 'OverconstrainedError' || err.name === 'ConstraintNotSatisfiedError') {
+        if (typeof console !== 'undefined' && console.warn) console.warn('[录音] 使用宽松约束重试: { audio: true }');
+        return navigator.mediaDevices.getUserMedia({ audio: true, video: false }).catch(function(e) {
+          if (typeof console !== 'undefined' && console.error) console.error('[录音] 宽松约束仍失败:', e.message || e);
+          return Promise.reject(e);
+        });
       }
-      const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      const rec = new Recognition();
-      rec.lang = 'en-US';
-      rec.continuous = false;
-      rec.interimResults = false;
-      rec.onresult = (e) => {
-        const t = (e.results[0] && e.results[0][0]) ? e.results[0][0].transcript.trim() : '';
-        resolve(t);
-      };
-      rec.onerror = () => reject(new Error('Recognition error'));
-      rec.start();
+      return Promise.reject(err);
     });
   }
 
-  /** 按住录音、松开评分：返回 { start, stop }，stop() 返回 Promise<transcript> */
+  /** 跟读：先取麦克风流（即时激活），再启动语音识别；可选启动 MediaRecorder；统一错误捕获并打印 */
+  function listenSTT() {
+    var stream = null;
+    var mediaRecorder = null;
+    var mimeType = getSupportedAudioMimeType();
+
+    function cleanup() {
+      if (stream) {
+        stream.getTracks().forEach(function(t) { t.stop(); });
+        stream = null;
+      }
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try { mediaRecorder.stop(); } catch (e) {}
+      }
+    }
+
+    return getMicStream()
+      .then(function(s) {
+        stream = s;
+        if (window.MediaRecorder && mimeType) {
+          try {
+            mediaRecorder = new MediaRecorder(s, { mimeType: mimeType, audioBitsPerSecond: 128000 });
+            mediaRecorder.start(100);
+          } catch (e) {
+            if (typeof console !== 'undefined' && console.warn) console.warn('[录音] MediaRecorder 启动失败:', e.message || e);
+          }
+        }
+        return startSpeechRecognition();
+      })
+      .then(function(transcript) {
+        cleanup();
+        return transcript;
+      })
+      .catch(function(err) {
+        cleanup();
+        if (typeof console !== 'undefined' && console.error) console.error('[录音] 跟读启动失败:', err.name, err.message || err);
+        throw err;
+      });
+
+    function startSpeechRecognition() {
+      return new Promise(function(resolve, reject) {
+        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+          reject(new Error('No speech recognition'));
+          return;
+        }
+        var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        var rec = new Recognition();
+        rec.lang = 'en-US';
+        rec.continuous = false;
+        rec.interimResults = false;
+        rec.onresult = function(e) {
+          var t = (e.results[0] && e.results[0][0]) ? e.results[0][0].transcript.trim() : '';
+          resolve(t);
+        };
+        rec.onerror = function(e) {
+          var errMsg = (e && e.error) ? e.error : 'Recognition error';
+          if (typeof console !== 'undefined' && console.error) console.error('[录音] 语音识别错误:', errMsg, e && e.message ? e.message : '');
+          reject(new Error(errMsg));
+        };
+        rec.onend = function() { if (mediaRecorder && mediaRecorder.state !== 'inactive') { try { mediaRecorder.stop(); } catch (e) {} } };
+        try {
+          rec.start();
+        } catch (e) {
+          if (typeof console !== 'undefined' && console.error) console.error('[录音] rec.start() 失败:', e.message || e);
+          reject(e);
+        }
+      });
+    }
+  }
+
+  /** 按住录音、松开评分：返回 { start, stop }，stop() 返回 Promise<transcript>；先取麦克风再启动识别，兼容安卓 */
   function listenSTTHold() {
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
       return { start: function() {}, stop: function() { return Promise.reject(new Error('No speech recognition')); } };
     }
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    let rec = null;
-    let resolveStop = null;
+    var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    var rec = null;
+    var resolveStop = null;
+    var stream = null;
     return {
       start: function() {
-        rec = new Recognition();
-        rec.lang = 'en-US';
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.onresult = function(e) {
-          const i = e.results.length - 1;
-          const j = e.results[i].length - 1;
-          if (e.results[i][j].transcript) rec._lastTranscript = e.results[i][j].transcript.trim();
-        };
-        rec.onerror = function() { if (resolveStop) resolveStop(''); };
-        rec._lastTranscript = '';
-        rec.start();
+        getMicStream()
+          .then(function(s) {
+            stream = s;
+            rec = new Recognition();
+            rec.lang = 'en-US';
+            rec.continuous = true;
+            rec.interimResults = true;
+            rec.onresult = function(e) {
+              var i = e.results.length - 1;
+              var j = e.results[i].length - 1;
+              if (e.results[i][j].transcript) rec._lastTranscript = e.results[i][j].transcript.trim();
+            };
+            rec.onerror = function(e) {
+              if (typeof console !== 'undefined' && console.error) console.error('[录音] 语音识别错误:', e && e.error ? e.error : 'unknown');
+              if (resolveStop) resolveStop(rec._lastTranscript || '');
+            };
+            rec._lastTranscript = '';
+            rec.start();
+          })
+          .catch(function(err) {
+            if (typeof console !== 'undefined' && console.error) console.error('[录音] 按住录音启动失败:', err.name, err.message || err);
+          });
       },
       stop: function() {
         return new Promise(function(resolve) {
-          if (!rec) { resolve(''); return; }
+          if (!rec) { if (stream) stream.getTracks().forEach(function(t) { t.stop(); }); resolve(''); return; }
           resolveStop = function(t) {
             try { rec.stop(); } catch (e) {}
+            if (stream) { stream.getTracks().forEach(function(t) { t.stop(); }); stream = null; }
             resolve(rec._lastTranscript || t || '');
           };
           rec.onresult = function(e) {
-            const i = e.results.length - 1;
-            const j = e.results[i].length - 1;
+            var i = e.results.length - 1;
+            var j = e.results[i].length - 1;
             if (e.results[i][j].transcript) rec._lastTranscript = e.results[i][j].transcript.trim();
           };
           try { rec.stop(); } catch (e) { resolve(rec._lastTranscript || ''); }
