@@ -724,4 +724,13 @@
       startStudyTimer();
     }, 0);
   }
+
+  // 页面加载时仅请求一次麦克风，后续跟读复用该流，避免 Chrome 反复弹窗
+  if (typeof window !== 'undefined') {
+    window.addEventListener('load', function () {
+      if (window.KiddoLearn && typeof window.KiddoLearn.initAudioStream === 'function') {
+        window.KiddoLearn.initAudioStream().catch(function () {});
+      }
+    });
+  }
 })(typeof window !== 'undefined' ? window : this);
