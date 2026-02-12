@@ -4,6 +4,6 @@
   "description": "Kiddo World - 跟读识别后端需阿里云密钥",
   "private": true,
   "dependencies": {
-    "formidable": "^3.5.1"
+    "@alicloud/pop-core": "^1.7.12"
   }
 }

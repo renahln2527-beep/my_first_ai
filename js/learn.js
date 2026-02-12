@@ -66,29 +66,118 @@
   
   var MAX_LISTEN_MS = 8000;
 
-  /** 上传音频 Blob 到 /api/recognize，返回识别文字；可选 setStatus('正在识别...') 在上传前调用 */
-  function uploadAndRecognize(blob, setStatus) {
+  /** 生成 32 位 hex 字符串（阿里云 message_id / task_id 要求） */
+  function randomHex32() {
+    var arr = new Uint8Array(16);
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(arr);
+    else for (var i = 0; i < 16; i++) arr[i] = Math.floor(Math.random() * 256);
+    return Array.prototype.map.call(arr, function(b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+
+  /**
+   * 先请求 /api/token 获取 token 与 appkey，再连接阿里云 WebSocket 实时识别，发送 blob 后返回识别文字。
+   * setStatus 可选，用于显示「正在识别...」。
+   */
+  function recognizeViaWebSocket(blob, setStatus) {
     if (typeof setStatus === 'function') setStatus('正在识别...');
-    var form = new FormData();
-    var ext = (blob.type || '').indexOf('ogg') !== -1 ? 'ogg' : 'webm';
-    form.append('audio', blob, 'audio.' + ext);
-    return fetch('/api/recognize', { method: 'POST', body: form })
+    var CHUNK_SIZE = 3200;
+    var taskId = randomHex32();
+    return fetch('/api/token')
       .then(function(r) {
         if (!r.ok) {
           return r.json().then(function(body) {
-            var err = new Error(body.message || body.error || r.statusText);
+            var err = new Error(body.error || body.message || r.statusText);
             err.response = { status: r.status, statusText: r.statusText, data: body };
             throw err;
           }).catch(function(e) {
             if (e.response) throw e;
-            var err = new Error(e.message || r.statusText);
-            err.response = { status: r.status, statusText: r.statusText };
-            throw err;
+            throw new Error(e.message || r.statusText);
           });
         }
         return r.json();
       })
-      .then(function(data) { return (data && data.text != null) ? String(data.text).trim() : ''; });
+      .then(function(data) {
+        var token = data.token || (data.Token && data.Token.Id);
+        var appkey = data.appkey;
+        if (!token || !appkey) {
+          var err = new Error('Token 或 Appkey 缺失');
+          err.response = { status: 500, data: data };
+          throw err;
+        }
+        return new Promise(function(resolve, reject) {
+          var wsUrl = 'wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1?token=' + encodeURIComponent(token);
+          var ws = new WebSocket(wsUrl);
+          var results = [];
+          var resolved = false;
+          function finish() {
+            if (resolved) return;
+            resolved = true;
+            try { ws.close(); } catch (e) {}
+            resolve(results.length ? results.join('') : '');
+          }
+          ws.onerror = function() { if (!resolved) { resolved = true; reject(new Error('WebSocket 连接失败')); } };
+          ws.onclose = function(ev) {
+            if (!resolved && !ev.wasClean) reject(new Error('连接异常关闭'));
+            else if (!resolved) finish();
+          };
+          ws.onopen = function() {
+            var startMsg = {
+              header: {
+                message_id: randomHex32(),
+                task_id: taskId,
+                namespace: 'SpeechTranscriber',
+                name: 'StartTranscription',
+                appkey: appkey
+              },
+              payload: {
+                format: 'opus',
+                sample_rate: 16000,
+                enable_punctuation_prediction: true
+              }
+            };
+            ws.send(JSON.stringify(startMsg));
+            blob.arrayBuffer().then(function(buf) {
+              var view = new Uint8Array(buf);
+              for (var i = 0; i < view.length; i += CHUNK_SIZE) {
+                ws.send(view.subarray(i, Math.min(i + CHUNK_SIZE, view.length)));
+              }
+              var stopMsg = {
+                header: {
+                  message_id: randomHex32(),
+                  task_id: taskId,
+                  namespace: 'SpeechTranscriber',
+                  name: 'StopTranscription',
+                  appkey: appkey
+                }
+              };
+              ws.send(JSON.stringify(stopMsg));
+            }).catch(function(e) {
+              if (!resolved) { resolved = true; reject(e); }
+            });
+          };
+          ws.onmessage = function(ev) {
+            if (typeof ev.data !== 'string') return;
+            var msg;
+            try { msg = JSON.parse(ev.data); } catch (e) { return; }
+            var header = msg.header || {};
+            var status = header.status;
+            if (status !== undefined && status !== 20000000) {
+              if (!resolved) {
+                resolved = true;
+                reject(new Error(header.status_message || ('status ' + status)));
+              }
+              return;
+            }
+            var name = header.name;
+            if (name === 'TranscriptionStarted') return;
+            if (name === 'SentenceEnd' && msg.payload && msg.payload.result != null) {
+              results.push(String(msg.payload.result).trim());
+            }
+            if (name === 'TranscriptionCompleted') finish();
+          };
+        });
+      })
+      .then(function(text) { return (text || '').trim(); });
   }
 
   function isStreamActive(s) {
@@ -203,7 +292,7 @@
       });
     }
   
-  /** 跟读：仅 MediaRecorder 录音，停止后上传 /api/recognize 获取识别文字。options.setStatus 可选，用于显示「正在识别...」 */
+  /** 跟读：仅 MediaRecorder 录音，停止后通过 /api/token + 阿里云 WebSocket 获取识别文字。options.setStatus 可选，用于显示「正在识别...」 */
   function listenSTT(options) {
     var opts = options || {};
     var setStatus = opts.setStatus || function() {};
@@ -256,7 +345,7 @@
       })
       .then(function(blob) {
         cleanup();
-        return uploadAndRecognize(blob, setStatus);
+        return recognizeViaWebSocket(blob, setStatus);
       })
       .catch(function(err) {
         cleanup();
@@ -315,7 +404,7 @@
           if (!mediaRecorder || mediaRecorder.state === 'inactive') { resolve(''); return; }
           mediaRecorder.onstop = function() {
             var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-            uploadAndRecognize(blob).then(resolve).catch(function() { resolve(''); });
+            recognizeViaWebSocket(blob).then(resolve).catch(function() { resolve(''); });
           };
           try { mediaRecorder.stop(); } catch (e) { resolve(''); }
         });
