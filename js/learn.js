@@ -93,14 +93,25 @@
     return buf;
   }
 
+  /** 规范化后比较：忽略大小写与标点，判断 result 是否包含 expected */
+  function intermediateContainsExpected(result, expected) {
+    if (typeof result !== 'string' || typeof expected !== 'string') return false;
+    var r = result.replace(/\s+/g, '').replace(/[.,!?;:'"()\[\]\-\s]/g, '').toLowerCase();
+    var e = expected.replace(/\s+/g, '').replace(/[.,!?;:'"()\[\]\-\s]/g, '').toLowerCase();
+    if (!e) return false;
+    return r.indexOf(e) !== -1;
+  }
+
   /**
    * 使用 Web Audio 采集麦克风 -> 16k 单声道 PCM -> 阿里云 WebSocket 实时识别。
    * 先请求 /api/token，连接 WS，发送 StartTranscription(format: pcm, sample_rate: 16000)，
    * 收到 TranscriptionStarted 后用 ScriptProcessorNode 实时采集并重采样为 16k PCM 发送。
+   * options: { expectedText } 可选，若提供则在 TranscriptionResultChanged 中一旦中间结果包含该文本即提前结束并判定成功。
    * 返回 { stop: function() => Promise<string> }，调用 stop() 发送 StopTranscription 并返回识别结果。
    */
-  function startPcmWebSocketSession(stream, setStatus) {
-    if (typeof setStatus === 'function') setStatus('正在识别...');
+  function startPcmWebSocketSession(stream, setStatus, options) {
+    var opts = options || {};
+    if (typeof setStatus === 'function') setStatus('正在连接...');
     var taskId = randomHex32();
     return fetch('/api/token')
       .then(function(r) {
@@ -132,10 +143,12 @@
         var finished = false;
         var processor = null;
         var audioCtx = null;
+        var connectionTimeoutId = null;
 
         function finish() {
           if (finished) return;
           finished = true;
+          if (connectionTimeoutId) { clearTimeout(connectionTimeoutId); connectionTimeoutId = null; }
           if (processor) try { processor.disconnect(); } catch (e) {}
           if (audioCtx) try { audioCtx.close(); } catch (e) {}
           try { ws.close(); } catch (e) {}
@@ -143,13 +156,19 @@
         }
 
         ws.onerror = function() {
-          if (!finished) { finished = true; finishReject(new Error('WebSocket 连接失败')); }
+          if (!finished) { finished = true; if (connectionTimeoutId) clearTimeout(connectionTimeoutId); finishReject(new Error('WebSocket 连接失败')); }
         };
         ws.onclose = function(ev) {
           if (!finished && !ev.wasClean) finishReject(new Error('连接异常关闭'));
           else if (!finished) finish();
         };
         ws.onopen = function() {
+          connectionTimeoutId = setTimeout(function() {
+            if (finished) return;
+            finished = true;
+            finishReject(new Error('连接超时，请重试'));
+            try { ws.close(); } catch (e) {}
+          }, 3000);
           var startMsg = {
             header: {
               message_id: randomHex32(),
@@ -161,7 +180,8 @@
             payload: {
               format: 'pcm',
               sample_rate: 16000,
-              enable_punctuation_prediction: true
+              enable_punctuation_prediction: true,
+              enable_intermediate_result: true
             }
           };
           ws.send(JSON.stringify(startMsg));
@@ -181,6 +201,8 @@
           }
           var name = header.name;
           if (name === 'TranscriptionStarted') {
+            if (connectionTimeoutId) { clearTimeout(connectionTimeoutId); connectionTimeoutId = null; }
+            if (typeof setStatus === 'function') setStatus('🔴 正在听...');
             var streamOk = stream && stream.active && stream.getTracks && stream.getTracks().length > 0;
             if (!streamOk) {
               if (!finished) { finished = true; finishReject(new Error('麦克风流无效或已断开')); }
@@ -220,6 +242,15 @@
             }
             return;
           }
+          if (name === 'TranscriptionResultChanged' && msg.payload && msg.payload.result != null) {
+            var mid = String(msg.payload.result).trim();
+            if (opts.expectedText && intermediateContainsExpected(mid, opts.expectedText)) {
+              results = [opts.expectedText];
+              if (ws.readyState === 1) ws.send(JSON.stringify(stopMsg));
+              finish();
+              return;
+            }
+          }
           if (name === 'SentenceEnd' && msg.payload && msg.payload.result != null) {
             results.push(String(msg.payload.result).trim());
           }
@@ -238,6 +269,7 @@
 
         return {
           stop: function() {
+            if (connectionTimeoutId) { clearTimeout(connectionTimeoutId); connectionTimeoutId = null; }
             if (processor) { try { processor.disconnect(); } catch (e) {} processor = null; }
             if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
             if (ws.readyState === 1) ws.send(JSON.stringify(stopMsg));
@@ -359,7 +391,7 @@
       });
     }
   
-  /** 跟读：Web Audio 采集麦克风 -> 16k PCM -> 阿里云 WebSocket 实时识别。options.setStatus 可选。 */
+  /** 跟读：Web Audio 采集麦克风 -> 16k PCM -> 阿里云 WebSocket 实时识别。options.setStatus、options.expectedText 可选。 */
   function listenSTT(options) {
     var opts = options || {};
     var setStatus = opts.setStatus || function() {};
@@ -377,8 +409,9 @@
       return { promise: Promise.reject(new Error('Web Audio not supported')), stop: function() {} };
     }
 
+    setStatus('正在连接...');
     getMicStream()
-      .then(function(stream) { return startPcmWebSocketSession(stream, setStatus); })
+      .then(function(stream) { return startPcmWebSocketSession(stream, setStatus, { expectedText: opts.expectedText }); })
       .then(function(session) {
         sessionRef = session;
         timeoutId = setTimeout(function() {
@@ -567,11 +600,20 @@
          </div>
        `;
   container.querySelector('[data-speak-play]').addEventListener('click', function() { speakTTS(w.word); });
-  container.querySelector('[data-speak-mic]').addEventListener('click', function() {
+  var speakMicBtn = container.querySelector('[data-speak-mic]');
+  speakMicBtn.addEventListener('click', function() {
     var resultEl = container.querySelector('[data-speak-result]');
-    resultEl.textContent = '正在听...';
-    var session = listenSTT({ setStatus: function(t) { resultEl.textContent = t; } });
+    function setStatus(t) {
+      resultEl.textContent = t;
+      if (speakMicBtn) {
+        speakMicBtn.textContent = (t === '正在连接...' || t === '🔴 正在听...') ? t : '🎤 说';
+        speakMicBtn.disabled = (t === '正在连接...' || t === '🔴 正在听...');
+      }
+    }
+    var session = listenSTT({ setStatus: setStatus, expectedText: w.word });
     session.promise.then(function(transcript) {
+      speakMicBtn.textContent = '🎤 说';
+      speakMicBtn.disabled = false;
       var normalized = (transcript || '').toLowerCase().replace(/\s/g, '');
       var expected = w.word.toLowerCase().replace(/\s/g, '');
       var ok = normalized === expected || normalized.includes(expected) || expected.includes(normalized);
@@ -587,7 +629,11 @@
         resultEl.textContent = '再试一次吧！你说: ' + (transcript || '(没听到)');
         KiddoStore.addWrongWordId(w.id);
       }
-    }).catch(function() { resultEl.textContent = '请允许麦克风后再试'; });
+    }).catch(function(err) {
+      speakMicBtn.textContent = '🎤 说';
+      speakMicBtn.disabled = false;
+      resultEl.textContent = (err && err.message) ? err.message : '请允许麦克风后再试';
+    });
   });
   }
   showOne();
@@ -780,9 +826,21 @@
   var micBtn = container.querySelector('[data-flash-mic]');
   if (micBtn) {
     micBtn.addEventListener('click', function() {
-      resultEl.textContent = '正在听...';
-      var session = listenSTT({ setStatus: function(t) { resultEl.textContent = t; } });
-      session.promise.then(doScore).catch(function() { resultEl.textContent = '请允许麦克风后再试'; });
+      function setStatus(t) {
+        resultEl.textContent = t;
+        micBtn.textContent = (t === '正在连接...' || t === '🔴 正在听...') ? t : '🎤 跟读';
+        micBtn.disabled = (t === '正在连接...' || t === '🔴 正在听...');
+      }
+      var session = listenSTT({ setStatus: setStatus, expectedText: w.word });
+      session.promise.then(function(transcript) {
+        micBtn.textContent = '🎤 跟读';
+        micBtn.disabled = false;
+        doScore(transcript);
+      }).catch(function(err) {
+        micBtn.textContent = '🎤 跟读';
+        micBtn.disabled = false;
+        resultEl.textContent = (err && err.message) ? err.message : '请允许麦克风后再试';
+      });
     });
   }
   container.querySelector('[data-flash-next]').addEventListener('click', function() {
@@ -834,11 +892,18 @@
   '</div>' +
   '</div>';
   container.querySelector('[data-sentence-speaker]').addEventListener('click', function() { speakTTS(en); });
-  container.querySelector('[data-sentence-mic]').addEventListener('click', function() {
+  var sentenceMicBtn = container.querySelector('[data-sentence-mic]');
+  sentenceMicBtn.addEventListener('click', function() {
     var resultEl = container.querySelector('[data-sentence-result]');
-    resultEl.textContent = '正在听...';
-    var session = listenSTT({ setStatus: function(t) { resultEl.textContent = t; } });
+    function setStatus(t) {
+      resultEl.textContent = t;
+      sentenceMicBtn.textContent = (t === '正在连接...' || t === '🔴 正在听...') ? t : '🎤 跟读';
+      sentenceMicBtn.disabled = (t === '正在连接...' || t === '🔴 正在听...');
+    }
+    var session = listenSTT({ setStatus: setStatus, expectedText: en });
     session.promise.then(function(transcript) {
+      sentenceMicBtn.textContent = '🎤 跟读';
+      sentenceMicBtn.disabled = false;
       var t = (transcript || '').trim();
       var ok = t.length > 3 && (en.toLowerCase().indexOf(t.toLowerCase()) !== -1 || t.toLowerCase().indexOf(en.toLowerCase().slice(0, 8)) !== -1);
       resultEl.textContent = ok ? '✓ 读得真好！' : ('再试一次～ 你说: ' + (t || '(没听到)'));
@@ -847,7 +912,11 @@
         if (typeof KiddoStore !== 'undefined' && KiddoStore.addLearnedSentenceId) KiddoStore.addLearnedSentenceId(s.id);
         if (typeof window !== 'undefined' && window.unlockNewContent) window.unlockNewContent('sentence', 1);
       }
-    }).catch(function() { resultEl.textContent = '请允许麦克风后再试'; });
+    }).catch(function(err) {
+      sentenceMicBtn.textContent = '🎤 跟读';
+      sentenceMicBtn.disabled = false;
+      resultEl.textContent = (err && err.message) ? err.message : '请允许麦克风后再试';
+    });
   });
   var prevBtn = container.querySelector('[data-sentence-prev]');
   var nextBtn = container.querySelector('[data-sentence-next]');
