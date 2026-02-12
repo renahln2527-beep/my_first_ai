@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "description": "Kiddo World - 跟读识别后端需阿里云密钥",
   "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "@alicloud/pop-core": "^1.8.0"
+    "@alicloud/pop-core": "^1.8.0",
+    "express": "^5.2.1"
   }
 }
