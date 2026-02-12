@@ -54,16 +54,6 @@
     el.style.display = 'block';
   }
 
-  /** 检测浏览器支持的录音 MIME 类型：首选 webm/opus（后端通用），备选 wav，最后兜底 '' 用浏览器默认 */
-  function getSupportedAudioMimeType() {
-    if (typeof window === 'undefined' || !window.MediaRecorder) return '';
-    var types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav', 'audio/webm;codecs=pcm'];
-    for (var i = 0; i < types.length; i++) {
-      if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(types[i])) return types[i];
-    }
-    return '';
-  }
-  
   var MAX_LISTEN_MS = 8000;
 
   /** 生成 32 位 hex 字符串（阿里云 message_id / task_id 要求） */
@@ -74,13 +64,43 @@
     return Array.prototype.map.call(arr, function(b) { return ('0' + b.toString(16)).slice(-2); }).join('');
   }
 
+  /** Float32 线性重采样到 16000 Hz，返回 Float32Array */
+  function resampleTo16k(float32, fromSampleRate) {
+    if (fromSampleRate === 16000) return float32;
+    var outLen = Math.floor(float32.length * 16000 / fromSampleRate);
+    var out = new Float32Array(outLen);
+    var ratio = fromSampleRate / 16000;
+    for (var i = 0; i < outLen; i++) {
+      var srcIndex = i * ratio;
+      var i0 = Math.floor(srcIndex);
+      var i1 = Math.min(i0 + 1, float32.length - 1);
+      var t = srcIndex - i0;
+      out[i] = float32[i0] + t * (float32[i1] - float32[i0]);
+    }
+    return out;
+  }
+
+  /** Float32 [-1,1] 转 16 位 PCM 小端，返回 ArrayBuffer */
+  function float32ToPcm16(float32) {
+    var len = float32.length;
+    var buf = new ArrayBuffer(len * 2);
+    var view = new DataView(buf);
+    for (var i = 0; i < len; i++) {
+      var s = Math.max(-1, Math.min(1, float32[i]));
+      var v = s < 0 ? s * 32768 : s * 32767;
+      view.setInt16(i * 2, v, true);
+    }
+    return buf;
+  }
+
   /**
-   * 先请求 /api/token 获取 token 与 appkey，再连接阿里云 WebSocket 实时识别，发送 blob 后返回识别文字。
-   * setStatus 可选，用于显示「正在识别...」。
+   * 使用 Web Audio 采集麦克风 -> 16k 单声道 PCM -> 阿里云 WebSocket 实时识别。
+   * 先请求 /api/token，连接 WS，发送 StartTranscription(format: pcm, sample_rate: 16000)，
+   * 收到 TranscriptionStarted 后用 ScriptProcessorNode 实时采集并重采样为 16k PCM 发送。
+   * 返回 { stop: function() => Promise<string> }，调用 stop() 发送 StopTranscription 并返回识别结果。
    */
-  function recognizeViaWebSocket(blob, setStatus) {
+  function startPcmWebSocketSession(stream, setStatus) {
     if (typeof setStatus === 'function') setStatus('正在识别...');
-    var CHUNK_SIZE = 3200;
     var taskId = randomHex32();
     return fetch('/api/token')
       .then(function(r) {
@@ -104,80 +124,107 @@
           err.response = { status: 500, data: data };
           throw err;
         }
-        return new Promise(function(resolve, reject) {
-          var wsUrl = 'wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1?token=' + encodeURIComponent(token);
-          var ws = new WebSocket(wsUrl);
-          var results = [];
-          var resolved = false;
-          function finish() {
-            if (resolved) return;
-            resolved = true;
-            try { ws.close(); } catch (e) {}
-            resolve(results.length ? results.join('') : '');
+        var wsUrl = 'wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1?token=' + encodeURIComponent(token);
+        var ws = new WebSocket(wsUrl);
+        var results = [];
+        var finishResolve, finishReject;
+        var finishPromise = new Promise(function(resolve, reject) { finishResolve = resolve; finishReject = reject; });
+        var finished = false;
+        var processor = null;
+        var audioCtx = null;
+
+        function finish() {
+          if (finished) return;
+          finished = true;
+          if (processor) try { processor.disconnect(); } catch (e) {}
+          if (audioCtx) try { audioCtx.close(); } catch (e) {}
+          try { ws.close(); } catch (e) {}
+          finishResolve(results.length ? results.join('') : '');
+        }
+
+        ws.onerror = function() {
+          if (!finished) { finished = true; finishReject(new Error('WebSocket 连接失败')); }
+        };
+        ws.onclose = function(ev) {
+          if (!finished && !ev.wasClean) finishReject(new Error('连接异常关闭'));
+          else if (!finished) finish();
+        };
+        ws.onopen = function() {
+          var startMsg = {
+            header: {
+              message_id: randomHex32(),
+              task_id: taskId,
+              namespace: 'SpeechTranscriber',
+              name: 'StartTranscription',
+              appkey: appkey
+            },
+            payload: {
+              format: 'pcm',
+              sample_rate: 16000,
+              enable_punctuation_prediction: true
+            }
+          };
+          ws.send(JSON.stringify(startMsg));
+        };
+        ws.onmessage = function(ev) {
+          if (typeof ev.data !== 'string') return;
+          var msg;
+          try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          var header = msg.header || {};
+          var status = header.status;
+          if (status !== undefined && status !== 20000000) {
+            if (!finished) {
+              finished = true;
+              finishReject(new Error(header.status_message || ('status ' + status)));
+            }
+            return;
           }
-          ws.onerror = function() { if (!resolved) { resolved = true; reject(new Error('WebSocket 连接失败')); } };
-          ws.onclose = function(ev) {
-            if (!resolved && !ev.wasClean) reject(new Error('连接异常关闭'));
-            else if (!resolved) finish();
-          };
-          ws.onopen = function() {
-            var startMsg = {
-              header: {
-                message_id: randomHex32(),
-                task_id: taskId,
-                namespace: 'SpeechTranscriber',
-                name: 'StartTranscription',
-                appkey: appkey
-              },
-              payload: {
-                format: 'opus',
-                sample_rate: 16000,
-                enable_punctuation_prediction: true
-              }
+          var name = header.name;
+          if (name === 'TranscriptionStarted') {
+            var Ctx = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new Ctx();
+            var source = audioCtx.createMediaStreamSource(stream);
+            var bufferSize = 4096;
+            processor = audioCtx.createScriptProcessor(bufferSize, 1, 0);
+            var gain = audioCtx.createGain();
+            gain.gain.value = 0;
+            source.connect(processor);
+            processor.connect(gain);
+            gain.connect(audioCtx.destination);
+            processor.onaudioprocess = function(e) {
+              if (ws.readyState !== 1) return;
+              var input = e.inputBuffer.getChannelData(0);
+              var resampled = resampleTo16k(input, audioCtx.sampleRate);
+              var pcm = float32ToPcm16(resampled);
+              ws.send(pcm);
             };
-            ws.send(JSON.stringify(startMsg));
-            blob.arrayBuffer().then(function(buf) {
-              var view = new Uint8Array(buf);
-              for (var i = 0; i < view.length; i += CHUNK_SIZE) {
-                ws.send(view.subarray(i, Math.min(i + CHUNK_SIZE, view.length)));
-              }
-              var stopMsg = {
-                header: {
-                  message_id: randomHex32(),
-                  task_id: taskId,
-                  namespace: 'SpeechTranscriber',
-                  name: 'StopTranscription',
-                  appkey: appkey
-                }
-              };
-              ws.send(JSON.stringify(stopMsg));
-            }).catch(function(e) {
-              if (!resolved) { resolved = true; reject(e); }
-            });
-          };
-          ws.onmessage = function(ev) {
-            if (typeof ev.data !== 'string') return;
-            var msg;
-            try { msg = JSON.parse(ev.data); } catch (e) { return; }
-            var header = msg.header || {};
-            var status = header.status;
-            if (status !== undefined && status !== 20000000) {
-              if (!resolved) {
-                resolved = true;
-                reject(new Error(header.status_message || ('status ' + status)));
-              }
-              return;
-            }
-            var name = header.name;
-            if (name === 'TranscriptionStarted') return;
-            if (name === 'SentenceEnd' && msg.payload && msg.payload.result != null) {
-              results.push(String(msg.payload.result).trim());
-            }
-            if (name === 'TranscriptionCompleted') finish();
-          };
-        });
-      })
-      .then(function(text) { return (text || '').trim(); });
+            return;
+          }
+          if (name === 'SentenceEnd' && msg.payload && msg.payload.result != null) {
+            results.push(String(msg.payload.result).trim());
+          }
+          if (name === 'TranscriptionCompleted') finish();
+        };
+
+        var stopMsg = {
+          header: {
+            message_id: randomHex32(),
+            task_id: taskId,
+            namespace: 'SpeechTranscriber',
+            name: 'StopTranscription',
+            appkey: appkey
+          }
+        };
+
+        return {
+          stop: function() {
+            if (processor) { try { processor.disconnect(); } catch (e) {} processor = null; }
+            if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+            if (ws.readyState === 1) ws.send(JSON.stringify(stopMsg));
+            return finishPromise.then(function(t) { return (t || '').trim(); });
+          }
+        };
+      });
   }
 
   function isStreamActive(s) {
@@ -292,67 +339,37 @@
       });
     }
   
-  /** 跟读：仅 MediaRecorder 录音，停止后通过 /api/token + 阿里云 WebSocket 获取识别文字。options.setStatus 可选，用于显示「正在识别...」 */
+  /** 跟读：Web Audio 采集麦克风 -> 16k PCM -> 阿里云 WebSocket 实时识别。options.setStatus 可选。 */
   function listenSTT(options) {
     var opts = options || {};
     var setStatus = opts.setStatus || function() {};
-    var mediaRecorder = null;
-    var mimeType = getSupportedAudioMimeType();
-    var chunks = [];
+    var sessionRef = null;
     var timeoutId = null;
-    var resolveRecording = null;
-    var recordingDone = new Promise(function(r) { resolveRecording = r; });
-
-    function cleanup() {
-      if (timeoutId) clearTimeout(timeoutId);
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        try { mediaRecorder.stop(); } catch (e) {}
-      }
-    }
+    var deferredResolve, deferredReject;
+    var mainPromise = new Promise(function(resolve, reject) { deferredResolve = resolve; deferredReject = reject; });
 
     if (typeof navigator !== 'undefined' && (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)) {
       showRecorderError('NotSupportedError: 当前浏览器不支持 getUserMedia');
       return { promise: Promise.reject(new Error('getUserMedia not supported')), stop: function() {} };
     }
+    if (typeof window === 'undefined' || (!window.AudioContext && !window.webkitAudioContext)) {
+      showRecorderError('当前浏览器不支持 Web Audio API');
+      return { promise: Promise.reject(new Error('Web Audio not supported')), stop: function() {} };
+    }
 
-    var promise = getMicStream()
-      .then(function(s) {
-        if (!window.MediaRecorder) {
-          return Promise.reject(new Error('MediaRecorder not supported'));
-        }
-        if (mimeType && (!MediaRecorder.isTypeSupported || !MediaRecorder.isTypeSupported(mimeType))) {
-          mimeType = '';
-        }
-        try {
-          mediaRecorder = mimeType
-            ? new MediaRecorder(s, { mimeType: mimeType, audioBitsPerSecond: 128000 })
-            : new MediaRecorder(s, { audioBitsPerSecond: 128000 });
-        } catch (e) {
-          mediaRecorder = new MediaRecorder(s, { audioBitsPerSecond: 128000 });
-        }
-        mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size) chunks.push(e.data); };
-        mediaRecorder.onstop = function() {
-          var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-          resolveRecording(blob);
-        };
-        mediaRecorder.start(100);
+    getMicStream()
+      .then(function(stream) { return startPcmWebSocketSession(stream, setStatus); })
+      .then(function(session) {
+        sessionRef = session;
         timeoutId = setTimeout(function() {
-          if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-            try { mediaRecorder.stop(); } catch (e) {}
-          }
+          if (sessionRef) sessionRef.stop().then(deferredResolve).catch(deferredReject);
         }, MAX_LISTEN_MS);
-        return recordingDone;
-      })
-      .then(function(blob) {
-        cleanup();
-        return recognizeViaWebSocket(blob, setStatus);
       })
       .catch(function(err) {
-        cleanup();
         if (err && err.response) {
           var r = err.response;
           if (typeof console !== 'undefined' && console.error) {
-            console.error('[录音] 上传/接口响应:', r.status, r.statusText, r.data);
+            console.error('[录音] 接口响应:', r.status, r.statusText, r.data);
           }
           showRecorderError('接口 ' + r.status + (r.statusText ? ' ' + r.statusText : '') + (r.data && r.data.message ? ' ' + r.data.message : ''));
         } else {
@@ -360,53 +377,37 @@
           if (typeof console !== 'undefined' && console.error) console.error('[录音] 跟读失败', msg);
           showRecorderError(msg);
         }
-        throw err;
+        deferredReject(err);
       });
 
     return {
-      promise: promise,
+      promise: mainPromise,
       stop: function() {
         if (timeoutId) clearTimeout(timeoutId);
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-          try { mediaRecorder.stop(); } catch (e) {}
-        }
+        if (sessionRef) sessionRef.stop().then(deferredResolve).catch(deferredReject);
       }
     };
   }
 
-  /** 按住录音、松开后上传识别：仅 MediaRecorder，无浏览器语音识别 */
+  /** 按住录音、松开后识别：Web Audio 采集 16k PCM，阿里云 WebSocket 实时识别 */
   function listenSTTHold() {
-    var mediaRecorder = null;
-    var chunks = [];
-    var mimeType = getSupportedAudioMimeType();
-    var resolveStop = null;
+    var sessionRef = null;
     return {
       start: function() {
-        getMicStream().then(function(s) {
-          if (!window.MediaRecorder) return;
-          if (mimeType && (!MediaRecorder.isTypeSupported || !MediaRecorder.isTypeSupported(mimeType))) mimeType = '';
-          try {
-            mediaRecorder = mimeType
-              ? new MediaRecorder(s, { mimeType: mimeType, audioBitsPerSecond: 128000 })
-              : new MediaRecorder(s, { audioBitsPerSecond: 128000 });
-          } catch (e) {
-            mediaRecorder = new MediaRecorder(s, { audioBitsPerSecond: 128000 });
-          }
-          chunks = [];
-          mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size) chunks.push(e.data); };
-          mediaRecorder.start(100);
+        getMicStream().then(function(stream) {
+          return startPcmWebSocketSession(stream, function() {});
+        }).then(function(session) {
+          sessionRef = session;
         }).catch(function(err) {
           if (typeof console !== 'undefined' && console.error) console.error('[录音] 按住录音启动失败:', err.message);
+          showRecorderError(err.message || '启动识别失败');
         });
       },
       stop: function() {
         return new Promise(function(resolve) {
-          if (!mediaRecorder || mediaRecorder.state === 'inactive') { resolve(''); return; }
-          mediaRecorder.onstop = function() {
-            var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-            recognizeViaWebSocket(blob).then(resolve).catch(function() { resolve(''); });
-          };
-          try { mediaRecorder.stop(); } catch (e) { resolve(''); }
+          if (!sessionRef) { resolve(''); return; }
+          sessionRef.stop().then(resolve).catch(function() { resolve(''); });
+          sessionRef = null;
         });
       }
     };
@@ -893,7 +894,6 @@
     speakTTS,
     listenSTT,
     listenSTTHold,
-    getSupportedAudioMimeType,
     getMicStream,
     initAudioStream,
     blobToBase64,
