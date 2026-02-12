@@ -181,16 +181,19 @@
           }
           var name = header.name;
           if (name === 'TranscriptionStarted') {
+            var streamOk = stream && stream.active && stream.getTracks && stream.getTracks().length > 0;
+            if (!streamOk) {
+              if (!finished) { finished = true; finishReject(new Error('麦克风流无效或已断开')); }
+              return;
+            }
             var Ctx = window.AudioContext || window.webkitAudioContext;
             audioCtx = new Ctx();
             var source = audioCtx.createMediaStreamSource(stream);
             var bufferSize = 4096;
-            processor = audioCtx.createScriptProcessor(bufferSize, 1, 0);
+            processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
             var gain = audioCtx.createGain();
             gain.gain.value = 0;
             source.connect(processor);
-            processor.connect(gain);
-            gain.connect(audioCtx.destination);
             processor.onaudioprocess = function(e) {
               if (ws.readyState !== 1) return;
               var input = e.inputBuffer.getChannelData(0);
@@ -198,6 +201,23 @@
               var pcm = float32ToPcm16(resampled);
               ws.send(pcm);
             };
+            function connectToDestination() {
+              if (!processor || !audioCtx || audioCtx.state === 'closed') return;
+              if (!stream.active) return;
+              processor.connect(gain);
+              gain.connect(audioCtx.destination);
+            }
+            if (audioCtx.state === 'suspended') {
+              audioCtx.resume().then(function() {
+                if (audioCtx.state === 'running') connectToDestination();
+              }).catch(function(err) {
+                if (!finished) { finished = true; finishReject(err); }
+              });
+            } else if (audioCtx.state === 'running') {
+              connectToDestination();
+            } else {
+              connectToDestination();
+            }
             return;
           }
           if (name === 'SentenceEnd' && msg.payload && msg.payload.result != null) {
