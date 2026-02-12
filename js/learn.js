@@ -54,10 +54,10 @@
     el.style.display = 'block';
   }
 
-  /** 检测浏览器支持的录音 MIME 类型；Edge 等优先尝试 audio/mp4，再 webm/ogg；不支持时降级为不指定格式 */
+  /** 检测浏览器支持的录音 MIME 类型：首选 webm/opus（后端通用），备选 wav，最后兜底 '' 用浏览器默认 */
   function getSupportedAudioMimeType() {
     if (typeof window === 'undefined' || !window.MediaRecorder) return '';
-    var types = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/webm;codecs=pcm'];
+    var types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav', 'audio/webm;codecs=pcm'];
     for (var i = 0; i < types.length; i++) {
       if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(types[i])) return types[i];
     }
@@ -225,9 +225,18 @@
       .then(function(transcript) { cleanup(); return transcript; })
       .catch(function(err) {
         cleanup();
-        var msg = (err && err.name ? err.name : 'Error') + ': ' + (err && err.message ? err.message : String(err));
-        if (typeof console !== 'undefined' && console.error) console.error('[录音] 跟读启动失败', msg);
-        showRecorderError(msg);
+        if (err && err.response) {
+          var r = err.response;
+          var status = r.status, statusText = r.statusText || '', data = r.data;
+          if (typeof console !== 'undefined' && console.error) {
+            console.error('[录音] 上传/接口响应:', status, statusText, data);
+          }
+          showRecorderError('接口 ' + status + (statusText ? ' ' + statusText : '') + (data ? ' ' + JSON.stringify(data).slice(0, 80) : ''));
+        } else {
+          var msg = (err && err.name ? err.name : 'Error') + ': ' + (err && err.message ? err.message : String(err));
+          if (typeof console !== 'undefined' && console.error) console.error('[录音] 跟读启动失败', msg);
+          showRecorderError(msg);
+        }
         throw err;
       });
 
@@ -824,6 +833,23 @@
       window.sharedAudioStream = null;
     }
   }
+
+  /** 上传/请求失败时在控制台打印 error.response（status、statusText、data），便于排查 400/415 等；若有 response 也会在页面上红色提示 */
+  function logUploadError(err) {
+    if (!err) return;
+    if (err.response) {
+      var r = err.response;
+      var status = r.status, statusText = r.statusText || '', data = r.data;
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[录音] 上传/接口 response:', 'status', status, 'statusText', statusText, 'data', data);
+      }
+      showRecorderError('接口 ' + status + (statusText ? ' ' + statusText : '') + (data != null ? ' ' + JSON.stringify(data).slice(0, 100) : ''));
+    } else {
+      if (typeof console !== 'undefined' && console.error) console.error('[录音] 上传/请求错误', err.message || err);
+      showRecorderError((err.message || String(err)).slice(0, 120));
+    }
+  }
+
   if (typeof window !== 'undefined') {
     window.addEventListener('pagehide', releaseAudioStream);
     window.addEventListener('beforeunload', releaseAudioStream);
@@ -845,6 +871,8 @@
     getMicStream,
     initAudioStream,
     blobToBase64,
+    showRecorderError,
+    logUploadError,
     hasSpeechRecognition: hasSpeechRecognition
   };
 })(typeof window !== 'undefined' ? window : this);
