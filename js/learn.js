@@ -66,7 +66,30 @@
   
   var MAX_LISTEN_MS = 8000;
 
-  var hasSpeechRecognition = !!(typeof window !== 'undefined' && (window.webkitSpeechRecognition || window.SpeechRecognition));
+  /** 上传音频 Blob 到 /api/recognize，返回识别文字；可选 setStatus('正在识别...') 在上传前调用 */
+  function uploadAndRecognize(blob, setStatus) {
+    if (typeof setStatus === 'function') setStatus('正在识别...');
+    var form = new FormData();
+    var ext = (blob.type || '').indexOf('ogg') !== -1 ? 'ogg' : 'webm';
+    form.append('audio', blob, 'audio.' + ext);
+    return fetch('/api/recognize', { method: 'POST', body: form })
+      .then(function(r) {
+        if (!r.ok) {
+          return r.json().then(function(body) {
+            var err = new Error(body.message || body.error || r.statusText);
+            err.response = { status: r.status, statusText: r.statusText, data: body };
+            throw err;
+          }).catch(function(e) {
+            if (e.response) throw e;
+            var err = new Error(e.message || r.statusText);
+            err.response = { status: r.status, statusText: r.statusText };
+            throw err;
+          });
+        }
+        return r.json();
+      })
+      .then(function(data) { return (data && data.text != null) ? String(data.text).trim() : ''; });
+  }
 
   function isStreamActive(s) {
     if (!s || !s.active) return false;
@@ -180,12 +203,16 @@
       });
     }
   
-  /** 跟读：复用 window.sharedAudioStream 与单例 Recognition，仅 start/stop；返回 { promise, stop } */
-  function listenSTT() {
+  /** 跟读：仅 MediaRecorder 录音，停止后上传 /api/recognize 获取识别文字。options.setStatus 可选，用于显示「正在识别...」 */
+  function listenSTT(options) {
+    var opts = options || {};
+    var setStatus = opts.setStatus || function() {};
     var mediaRecorder = null;
+    var mimeType = getSupportedAudioMimeType();
     var chunks = [];
-    var stopRec = null;
     var timeoutId = null;
+    var resolveRecording = null;
+    var recordingDone = new Promise(function(r) { resolveRecording = r; });
 
     function cleanup() {
       if (timeoutId) clearTimeout(timeoutId);
@@ -201,168 +228,96 @@
 
     var promise = getMicStream()
       .then(function(s) {
-        var mimeType = getSupportedAudioMimeType();
-        if (window.MediaRecorder) {
-          if (mimeType && (!MediaRecorder.isTypeSupported || !MediaRecorder.isTypeSupported(mimeType))) {
-            if (typeof console !== 'undefined' && console.warn) console.warn('[录音] MIME 不支持:', mimeType, '，降级为浏览器默认格式');
-            mimeType = '';
-          }
-          try {
-            if (mimeType) {
-              mediaRecorder = new MediaRecorder(s, { mimeType: mimeType, audioBitsPerSecond: 128000 });
-            } else {
-              mediaRecorder = new MediaRecorder(s, { audioBitsPerSecond: 128000 });
-            }
-            mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size) chunks.push(e.data); };
-            mediaRecorder.start(100);
-          } catch (e) {
-            if (typeof console !== 'undefined' && console.error) console.error('[录音] MediaRecorder 启动失败 Name:', e.name, 'Message:', e.message);
-            showRecorderError((e.name || 'Error') + ': ' + (e.message || ''));
-          }
+        if (!window.MediaRecorder) {
+          return Promise.reject(new Error('MediaRecorder not supported'));
         }
-        return startSpeechRecognition();
+        if (mimeType && (!MediaRecorder.isTypeSupported || !MediaRecorder.isTypeSupported(mimeType))) {
+          mimeType = '';
+        }
+        try {
+          mediaRecorder = mimeType
+            ? new MediaRecorder(s, { mimeType: mimeType, audioBitsPerSecond: 128000 })
+            : new MediaRecorder(s, { audioBitsPerSecond: 128000 });
+        } catch (e) {
+          mediaRecorder = new MediaRecorder(s, { audioBitsPerSecond: 128000 });
+        }
+        mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size) chunks.push(e.data); };
+        mediaRecorder.onstop = function() {
+          var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          resolveRecording(blob);
+        };
+        mediaRecorder.start(100);
+        timeoutId = setTimeout(function() {
+          if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            try { mediaRecorder.stop(); } catch (e) {}
+          }
+        }, MAX_LISTEN_MS);
+        return recordingDone;
       })
-      .then(function(transcript) { cleanup(); return transcript; })
+      .then(function(blob) {
+        cleanup();
+        return uploadAndRecognize(blob, setStatus);
+      })
       .catch(function(err) {
         cleanup();
         if (err && err.response) {
           var r = err.response;
-          var status = r.status, statusText = r.statusText || '', data = r.data;
           if (typeof console !== 'undefined' && console.error) {
-            console.error('[录音] 上传/接口响应:', status, statusText, data);
+            console.error('[录音] 上传/接口响应:', r.status, r.statusText, r.data);
           }
-          showRecorderError('接口 ' + status + (statusText ? ' ' + statusText : '') + (data ? ' ' + JSON.stringify(data).slice(0, 80) : ''));
+          showRecorderError('接口 ' + r.status + (r.statusText ? ' ' + r.statusText : '') + (r.data && r.data.message ? ' ' + r.data.message : ''));
         } else {
           var msg = (err && err.name ? err.name : 'Error') + ': ' + (err && err.message ? err.message : String(err));
-          if (typeof console !== 'undefined' && console.error) console.error('[录音] 跟读启动失败', msg);
+          if (typeof console !== 'undefined' && console.error) console.error('[录音] 跟读失败', msg);
           showRecorderError(msg);
         }
         throw err;
       });
 
-    function startSpeechRecognition() {
-      return new Promise(function(resolve, reject) {
-        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-          reject(new Error('No speech recognition'));
-          return;
-        }
-        if (window._recognitionInUse) {
-          reject(new Error('Recognition busy'));
-          return;
-        }
-        var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!window.sharedRecognition) {
-          window.sharedRecognition = new Recognition();
-          window.sharedRecognition.lang = 'en-US';
-          window.sharedRecognition.interimResults = true;
-        }
-        var rec = window.sharedRecognition;
-        rec.continuous = false;
-        var resolved = false;
-        var finalTranscript = '';
-
-        function finish(t) {
-          if (resolved) return;
-          resolved = true;
-          window._recognitionInUse = false;
-          var text = (t || finalTranscript || '').trim();
-          if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-            mediaRecorder.onstop = function() { resolve(text); };
-            try { mediaRecorder.stop(); } catch (e) { resolve(text); }
-          } else {
-            resolve(text);
-          }
-        }
-
-        stopRec = function() {
-          if (resolved) return;
-          try { rec.stop(); } catch (e) {}
-        };
-
-        rec.onresult = function(e) {
-          var r = e.results[e.results.length - 1];
-          if (r && r[0]) finalTranscript = (r[0].transcript || '').trim();
-          if (r && r.isFinal) finish(finalTranscript);
-        };
-        rec.onerror = function(e) {
-          var errMsg = (e && e.error) ? e.error : 'Recognition error';
-          if (typeof console !== 'undefined' && console.error) console.error('[录音] 语音识别错误:', errMsg);
-          if (!resolved) { window._recognitionInUse = false; reject(new Error(errMsg)); }
-        };
-        rec.onend = function() { finish(finalTranscript); };
-        timeoutId = setTimeout(function() {
-          if (resolved) return;
-          if (typeof console !== 'undefined' && console.warn) console.warn('[录音] 达到最大时长，自动结束');
-          stopRec();
-        }, MAX_LISTEN_MS);
-        window._recognitionInUse = true;
-        try {
-          rec.start();
-        } catch (e) {
-          window._recognitionInUse = false;
-          if (typeof console !== 'undefined' && console.error) console.error('[录音] rec.start() 失败:', e.message || e);
-          reject(e);
-        }
-      });
-    }
-
     return {
       promise: promise,
       stop: function() {
         if (timeoutId) clearTimeout(timeoutId);
-        if (stopRec) stopRec();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          try { mediaRecorder.stop(); } catch (e) {}
+        }
       }
     };
   }
-  
-  /** 按住录音、松开评分：复用 window.sharedAudioStream 与 window.sharedRecognition，仅 start/stop，不关闭流 */
+
+  /** 按住录音、松开后上传识别：仅 MediaRecorder，无浏览器语音识别 */
   function listenSTTHold() {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-      return { start: function() {}, stop: function() { return Promise.reject(new Error('No speech recognition')); } };
-    }
-    var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!window.sharedRecognition) {
-      window.sharedRecognition = new Recognition();
-      window.sharedRecognition.lang = 'en-US';
-      window.sharedRecognition.interimResults = true;
-    }
-    var rec = window.sharedRecognition;
+    var mediaRecorder = null;
+    var chunks = [];
+    var mimeType = getSupportedAudioMimeType();
     var resolveStop = null;
     return {
       start: function() {
-        if (window._recognitionInUse) return;
-        getMicStream().then(function() {
-          rec.continuous = true;
-          rec.onresult = function(e) {
-            var i = e.results.length - 1, j = e.results[i].length - 1;
-            if (e.results[i][j].transcript) rec._lastTranscript = e.results[i][j].transcript.trim();
-          };
-          rec.onerror = function(e) {
-            if (typeof console !== 'undefined' && console.error) console.error('[录音] 语音识别错误:', e && e.error ? e.error : 'unknown');
-            if (resolveStop) resolveStop(rec._lastTranscript || '');
-            window._recognitionInUse = false;
-          };
-          rec._lastTranscript = '';
-          window._recognitionInUse = true;
-          rec.start();
+        getMicStream().then(function(s) {
+          if (!window.MediaRecorder) return;
+          if (mimeType && (!MediaRecorder.isTypeSupported || !MediaRecorder.isTypeSupported(mimeType))) mimeType = '';
+          try {
+            mediaRecorder = mimeType
+              ? new MediaRecorder(s, { mimeType: mimeType, audioBitsPerSecond: 128000 })
+              : new MediaRecorder(s, { audioBitsPerSecond: 128000 });
+          } catch (e) {
+            mediaRecorder = new MediaRecorder(s, { audioBitsPerSecond: 128000 });
+          }
+          chunks = [];
+          mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size) chunks.push(e.data); };
+          mediaRecorder.start(100);
         }).catch(function(err) {
-          if (typeof console !== 'undefined' && console.error) console.error('[录音] 按住录音启动失败:', err.name, err.message || err);
+          if (typeof console !== 'undefined' && console.error) console.error('[录音] 按住录音启动失败:', err.message);
         });
       },
       stop: function() {
         return new Promise(function(resolve) {
-          if (!rec || !window._recognitionInUse) { resolve(''); return; }
-          resolveStop = function(t) {
-            try { rec.stop(); } catch (e) {}
-            window._recognitionInUse = false;
-            resolve(rec._lastTranscript || t || '');
+          if (!mediaRecorder || mediaRecorder.state === 'inactive') { resolve(''); return; }
+          mediaRecorder.onstop = function() {
+            var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+            uploadAndRecognize(blob).then(resolve).catch(function() { resolve(''); });
           };
-          rec.onresult = function(e) {
-            var i = e.results.length - 1, j = e.results[i].length - 1;
-            if (e.results[i][j].transcript) rec._lastTranscript = e.results[i][j].transcript.trim();
-          };
-          try { rec.stop(); } catch (e) { resolve(rec._lastTranscript || ''); }
-          setTimeout(function() { if (resolveStop) resolveStop(rec._lastTranscript || ''); }, 800);
+          try { mediaRecorder.stop(); } catch (e) { resolve(''); }
         });
       }
     };
@@ -497,7 +452,6 @@
            <p class="text-gray-400 text-sm mb-4">${w.phonetic}</p>
            <button type="button" data-speak-play class="px-4 py-2 bg-gray-200 rounded-xl mr-2">🔊 听</button>
            <button type="button" data-speak-mic class="px-4 py-2 bg-green-500 text-white rounded-xl">🎤 说</button>
-           ${!hasSpeechRecognition ? '<p class="mt-2 text-sm text-amber-600">建议使用 Chrome 浏览器以获得最佳录音效果</p>' : ''}
            <p class="mt-4 text-sm" data-speak-result></p>
            <p class="mt-4 text-sm text-amber-600" data-speak-progress>正确 ${correctCount} / ${TASKS_PER_APPLE} → 得 🍎</p>
          </div>
@@ -505,12 +459,8 @@
   container.querySelector('[data-speak-play]').addEventListener('click', function() { speakTTS(w.word); });
   container.querySelector('[data-speak-mic]').addEventListener('click', function() {
     var resultEl = container.querySelector('[data-speak-result]');
-    if (!hasSpeechRecognition) {
-      resultEl.textContent = '建议使用 Chrome 浏览器以获得最佳录音效果';
-      return;
-    }
     resultEl.textContent = '正在听...';
-    var session = listenSTT();
+    var session = listenSTT({ setStatus: function(t) { resultEl.textContent = t; } });
     session.promise.then(function(transcript) {
       var normalized = (transcript || '').toLowerCase().replace(/\s/g, '');
       var expected = w.word.toLowerCase().replace(/\s/g, '');
@@ -694,9 +644,7 @@
            <p class="text-xl text-gray-600 mb-4">${w.translation || ''}</p>
            <button type="button" data-flash-speaker class="p-2 rounded-full bg-amber-100 text-2xl mb-2">🔊</button>
            <p class="text-sm text-gray-500 mb-2">点击「跟读」说话，说完自动评分</p>
-           ${!hasSpeechRecognition ? '<p class="text-sm text-amber-600 mb-2">建议使用 Chrome 浏览器以获得最佳录音效果</p>' : ''}
            <button type="button" data-flash-mic class="py-3 px-6 bg-green-500 text-white rounded-2xl font-bold">🎤 跟读</button>
-           ${!hasSpeechRecognition ? '<button type="button" data-flash-mock class="py-2 px-4 ml-2 bg-gray-200 rounded-xl text-sm">模拟测试</button>' : ''}
            <p class="mt-4 text-sm min-h-[1.5rem]" data-flash-result></p>
            <div class="mt-6">
              <button type="button" data-flash-next class="py-2 px-4 bg-blue-100 text-blue-700 rounded-xl font-bold">下一个 →</button>
@@ -722,17 +670,11 @@
   var micBtn = container.querySelector('[data-flash-mic]');
   if (micBtn) {
     micBtn.addEventListener('click', function() {
-      if (!hasSpeechRecognition) {
-        resultEl.textContent = '建议使用 Chrome 浏览器以获得最佳录音效果';
-        return;
-      }
       resultEl.textContent = '正在听...';
-      var session = listenSTT();
+      var session = listenSTT({ setStatus: function(t) { resultEl.textContent = t; } });
       session.promise.then(doScore).catch(function() { resultEl.textContent = '请允许麦克风后再试'; });
     });
   }
-  var mockBtn = container.querySelector('[data-flash-mock]');
-  if (mockBtn) mockBtn.addEventListener('click', function() { doScore(w.word); });
   container.querySelector('[data-flash-next]').addEventListener('click', function() {
   if (typeof KiddoStore !== 'undefined' && KiddoStore.addLearnedWord) KiddoStore.addLearnedWord(w.id);
   if (typeof window !== 'undefined' && window.unlockNewContent) window.unlockNewContent('vocabulary', 1);
@@ -775,7 +717,6 @@
   '<button type="button" data-sentence-speaker class="py-3 px-6 bg-amber-100 rounded-2xl font-bold text-amber-800">🔊 读句子</button>' +
   '<button type="button" data-sentence-mic class="py-3 px-6 bg-green-500 text-white rounded-2xl font-bold">🎤 跟读</button>' +
   '</div>' +
-  (!hasSpeechRecognition ? '<p class="mt-2 text-sm text-amber-600">建议使用 Chrome 浏览器以获得最佳录音效果</p>' : '') +
   '<p class="mt-4 text-sm min-h-[1.5rem]" data-sentence-result></p>' +
   '<div class="mt-6 flex justify-center gap-4">' +
   '<button type="button" data-sentence-prev class="py-2 px-4 bg-gray-200 rounded-xl font-bold">⬅️ 上一句</button>' +
@@ -785,12 +726,8 @@
   container.querySelector('[data-sentence-speaker]').addEventListener('click', function() { speakTTS(en); });
   container.querySelector('[data-sentence-mic]').addEventListener('click', function() {
     var resultEl = container.querySelector('[data-sentence-result]');
-    if (!hasSpeechRecognition) {
-      resultEl.textContent = '建议使用 Chrome 浏览器以获得最佳录音效果';
-      return;
-    }
     resultEl.textContent = '正在听...';
-    var session = listenSTT();
+    var session = listenSTT({ setStatus: function(t) { resultEl.textContent = t; } });
     session.promise.then(function(transcript) {
       var t = (transcript || '').trim();
       var ok = t.length > 3 && (en.toLowerCase().indexOf(t.toLowerCase()) !== -1 || t.toLowerCase().indexOf(en.toLowerCase().slice(0, 8)) !== -1);
@@ -872,7 +809,6 @@
     initAudioStream,
     blobToBase64,
     showRecorderError,
-    logUploadError,
-    hasSpeechRecognition: hasSpeechRecognition
+    logUploadError
   };
 })(typeof window !== 'undefined' ? window : this);
