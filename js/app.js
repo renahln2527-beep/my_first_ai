@@ -589,12 +589,16 @@
   function updateProgressDisplay() {
     const totalWords = (typeof window !== 'undefined' && window.vocabularyList) ? window.vocabularyList.length : 0;
     const totalSentences = (typeof window !== 'undefined' && window.sentenceList) ? window.sentenceList.length : 0;
-    const wordIndex = (typeof window !== 'undefined' && window.userProgress) ? (window.userProgress.wordIndex || 0) : 0;
-    const sentenceIndex = (typeof window !== 'undefined' && window.userProgress) ? (window.userProgress.sentenceIndex || 0) : 0;
+    const learnedWordCount = (typeof KiddoStore !== 'undefined' && typeof KiddoStore.getLearnedWordIds === 'function')
+      ? (KiddoStore.getLearnedWordIds() || []).length
+      : 0;
+    const learnedSentenceCount = (typeof KiddoStore !== 'undefined' && typeof KiddoStore.getLearnedSentenceIds === 'function')
+      ? (KiddoStore.getLearnedSentenceIds() || []).length
+      : 0;
     const wordEl = document.querySelector('[data-word-progress]');
     const sentenceEl = document.querySelector('[data-sentence-progress]');
-    if (wordEl) wordEl.textContent = '📖 单词解锁: ' + wordIndex + ' / ' + totalWords;
-    if (sentenceEl) sentenceEl.textContent = '🗣️ 句子解锁: ' + sentenceIndex + ' / ' + totalSentences;
+    if (wordEl) wordEl.textContent = '📖 单词解锁: ' + learnedWordCount + ' / ' + totalWords;
+    if (sentenceEl) sentenceEl.textContent = '🗣️ 句子解锁: ' + learnedSentenceCount + ' / ' + totalSentences;
   }
 
   function refreshApples() {
